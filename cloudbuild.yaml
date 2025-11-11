@@ -23,33 +23,36 @@ steps:
   args:
     ['push', '${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA']
 
-# 3️⃣ Verificación de conexión a Cloud SQL (sin usar variables de entorno)
+# 3️⃣ Verify Cloud SQL connection (fixed: escaped $$ variables)
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
   id: 'Check DB Connection'
   entrypoint: 'bash'
   args:
     - '-eux'
     - |
-      echo "🔍 Verificando conexión a Cloud SQL ${_SQL_INSTANCE}..."
+      echo "🔍 Verifying connection to Cloud SQL instance ${_SQL_INSTANCE}..."
       
-      # Obtener usuario y contraseña directamente de Secret Manager
+      # Get database credentials from Secret Manager
       DB_USER=$(gcloud secrets versions access latest --secret=${_DB_USER_SECRET})
       DB_PASS=$(gcloud secrets versions access latest --secret=${_DB_PASSWORD_SECRET})
 
-      # Descargar proxy y cliente psql
+      # Download Cloud SQL Proxy and install PostgreSQL client
       curl -fsSL -o cloud_sql_proxy https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64
       chmod +x cloud_sql_proxy
       apt-get update -y && apt-get install -y postgresql-client
 
-      # Ejecutar proxy en background
+      # Start the proxy in the background
       ./cloud_sql_proxy -instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE}=tcp:5432 &
       sleep 5
 
-      # Intentar conexión al PostgreSQL
-      export PGPASSWORD="$DB_PASS"
-      psql -h 127.0.0.1 -p 5432 -U "$DB_USER" -d "${_DB_NAME}" -c "SELECT '✅ Conexión exitosa a la base de datos' AS status;" || {
-        echo "❌ Falló la conexión a la base de datos"; exit 1;
+      # Use escaped $$ so Cloud Build doesn't treat them as substitution variables
+      export PGPASSWORD="$$DB_PASS"
+      echo "⏳ Attempting to connect to DB..."
+      psql -h 172.30.96.5 -p 5432 -U "$$DB_USER" -d "${_DB_NAME}" -c "SELECT '✅ Database connection successful' AS status;" || {
+        echo "❌ Database connection failed"; exit 1;
       }
+
+      echo "✅ Cloud SQL connection verified successfully!"
 
 # 4️⃣ Despliegue del backend en Cloud Run
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
