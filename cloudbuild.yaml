@@ -2,7 +2,7 @@ substitutions:
   _REGION: us-east1
   _PROJECT: poccv-taskmanagertienda-qas
   _SERVICE: taskmanager-back-qas
-  _REPO: taskmanager-back-repo
+  _REPO: taskmanagertienda-backend-repo
   _SQL_INSTANCE: taskmanager-sql-db
   _VPC_CONNECTOR: serverless-connector-qas
   _SA_EMAIL: sa-cloudrun-taskmanager@poccv-taskmanagertienda-qas.iam.gserviceaccount.com
@@ -11,114 +11,54 @@ substitutions:
   _DB_NAME: appdb
 
 steps:
-# 1️⃣ Build Docker image
+# 1️⃣ Construcción de imagen Docker
 - name: 'gcr.io/cloud-builders/docker'
+  id: 'Build image'
   args:
     ['build', '-t', '${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA', '.']
 
-# 2️⃣ Push to Artifact Registry
+# 2️⃣ Push de imagen a Artifact Registry
 - name: 'gcr.io/cloud-builders/docker'
+  id: 'Push image'
   args:
     ['push', '${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA']
 
-# 3️⃣ Retrieve database credentials from Secret Manager and write to /workspace/.env
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-  id: 'Fetch DB Secrets'
-  entrypoint: 'bash'
-  args:
-    - '-eux'
-    - |
-      echo "🔑 Getting DB credentials from Secret Manager..."
-      # Leer secretos (asegúrate de que la cuenta de Cloud Build tenga secretAccessor)
-      DB_USER_RAW="$(gcloud secrets versions access latest --secret=${_DB_USER_SECRET} 2>/dev/null || true)"
-      DB_PASS_RAW="$(gcloud secrets versions access latest --secret=${_DB_PASSWORD_SECRET} 2>/dev/null || true)"
-
-      if [ -z "$DB_USER_RAW" ] || [ -z "$DB_PASS_RAW" ]; then
-        echo "❌ Error: No se pudieron leer los secretos DB (verifica permisos y nombres)."
-        exit 1
-      fi
-
-      # Guardar de forma segura en /workspace/.env (no dejar nuevas líneas extras)
-      ENV_FILE="/workspace/.env"
-      printf 'DB_USER=%s\n' "$DB_USER_RAW" > "$ENV_FILE"
-      printf 'DB_PASS=%s\n' "$DB_PASS_RAW" >> "$ENV_FILE"
-      printf 'DB_NAME=%s\n' "${_DB_NAME}" >> "$ENV_FILE"
-      chmod 600 "$ENV_FILE"
-      echo "✅ Secrets written to $ENV_FILE"
-
-# 4️⃣ Verify Cloud SQL connection using Cloud SQL Auth Proxy + psql (in the same step)
+# 3️⃣ Verificación de conexión a Cloud SQL (sin usar variables de entorno)
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
   id: 'Check DB Connection'
   entrypoint: 'bash'
   args:
     - '-eux'
     - |
-      set -o pipefail
-      ENV_FILE="/workspace/.env"
-      if [ ! -f "$ENV_FILE" ]; then
-        echo "❌ Missing $ENV_FILE"
-        exit 1
-      fi
-      # Export variables
-      source "$ENV_FILE"
+      echo "🔍 Verificando conexión a Cloud SQL ${_SQL_INSTANCE}..."
+      
+      # Obtener usuario y contraseña directamente de Secret Manager
+      DB_USER=$(gcloud secrets versions access latest --secret=${_DB_USER_SECRET})
+      DB_PASS=$(gcloud secrets versions access latest --secret=${_DB_PASSWORD_SECRET})
 
-      echo "🔍 Testing connection to Cloud SQL instance ${_SQL_INSTANCE} (via Cloud SQL Auth Proxy)..."
+      # Descargar proxy y cliente psql
+      curl -fsSL -o cloud_sql_proxy https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64
+      chmod +x cloud_sql_proxy
+      apt-get update -y && apt-get install -y postgresql-client
 
-      # Descargar cloud_sql_proxy
-      PROXY_BIN="/workspace/cloud_sql_proxy"
-      if [ ! -f "$PROXY_BIN" ]; then
-        echo "⬇️  Descargando cloud_sql_proxy..."
-        curl -fSsL -o "${PROXY_BIN}" "https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64"
-        chmod +x "${PROXY_BIN}"
-      fi
+      # Ejecutar proxy en background
+      ./cloud_sql_proxy -instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE}=tcp:5432 &
+      sleep 5
 
-      # Levantar proxy en background
-      "${PROXY_BIN}" -instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE}=tcp:5432 &
-
-      # Esperar que el proxy esté listo
-      for i in $(seq 1 15); do
-        if ss -ltn | grep -q ':5432'; then
-          echo "☑️ cloud_sql_proxy está escuchando en tcp:5432"
-          break
-        fi
-        echo "Esperando cloud_sql_proxy... ($i/15)"
-        sleep 1
-      done
-
-      # Instalar cliente psql (si no está presente)
-      if ! command -v psql >/dev/null 2>&1; then
-        echo "📦 Instalando postgresql-client..."
-        apt-get update -y
-        apt-get install -y postgresql-client
-      fi
-
-      # Intento de conexión (usa PGPASSWORD para no exponer en comando)
+      # Intentar conexión al PostgreSQL
       export PGPASSWORD="$DB_PASS"
-      ATTEMPTS=0
-      until PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p 5432 -U "$DB_USER" -d "${DB_NAME}" -c "SELECT 1;" >/dev/null 2>&1; do
-        ATTEMPTS=$((ATTEMPTS+1))
-        echo "Intento $ATTEMPTS: psql no responde aún..."
-        if [ "$ATTEMPTS" -ge 6 ]; then
-          echo "❌ No se pudo conectar a la base de datos después de varios intentos."
-          # mostrar logs del proxy si hay
-          ps aux | grep cloud_sql_proxy || true
-          exit 1
-        fi
-        sleep 3
-      done
+      psql -h 127.0.0.1 -p 5432 -U "$DB_USER" -d "${_DB_NAME}" -c "SELECT '✅ Conexión exitosa a la base de datos' AS status;" || {
+        echo "❌ Falló la conexión a la base de datos"; exit 1;
+      }
 
-      echo "✅ Database connection successful."
-
-# 5️⃣ Deploy backend to Cloud Run
+# 4️⃣ Despliegue del backend en Cloud Run
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-  id: 'Deploy Backend Service'
+  id: 'Deploy Cloud Run'
   entrypoint: 'bash'
   args:
     - '-eux'
     - |
-      # Cargar env
-      source /workspace/.env || true
-      echo "🚀 Deploying ${_SERVICE} to Cloud Run..."
+      echo "🚀 Desplegando servicio ${_SERVICE}..."
       gcloud run deploy ${_SERVICE} \
         --image=${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA \
         --region=${_REGION} \
@@ -128,7 +68,7 @@ steps:
         --memory=1Gi \
         --vpc-connector=${_VPC_CONNECTOR} \
         --add-cloudsql-instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE} \
-        --set-env-vars=CLOUD_SQL_CONNECTION_NAME=${_PROJECT}:${_REGION}:${_SQL_INSTANCE},DB_NAME=${_DB_NAME},DB_USER_SECRET=${_DB_USER_SECRET},DB_PASSWORD_SECRET=${_DB_PASSWORD_SECRET} \
+        --set-env-vars="CLOUD_SQL_CONNECTION_NAME=${_PROJECT}:${_REGION}:${_SQL_INSTANCE},DB_NAME=${_DB_NAME},DB_USER_SECRET=${_DB_USER_SECRET},DB_PASSWORD_SECRET=${_DB_PASSWORD_SECRET}" \
         --allow-unauthenticated
 
 images:
