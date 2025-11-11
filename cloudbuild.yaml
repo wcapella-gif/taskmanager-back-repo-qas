@@ -1,0 +1,79 @@
+substitutions:
+  _REGION: us-east1
+  _PROJECT: poccv-taskmanagertienda-qas
+  _SERVICE: taskmanager-back-qas
+  _REPO: taskmanager-back-repo
+  _SQL_INSTANCE: taskmanager-sql-db
+  _VPC_CONNECTOR: serverless-connector-qas
+  _SA_EMAIL: sa-cloudrun-taskmanager@poccv-taskmanagertienda-qas.iam.gserviceaccount.com
+  _DB_USER_SECRET: _DB_USER_SECRET_NAME
+  _DB_PASSWORD_SECRET: _DB_PASSWORD_SECRET_NAME
+  _DB_NAME: appdb
+
+steps:
+# 1️⃣ Build Docker image
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    ['build', '-t', '${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA', '.']
+
+# 2️⃣ Push to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    ['push', '${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA']
+
+# 3️⃣ Retrieve database credentials from Secret Manager
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  id: 'Fetch DB Secrets'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "🔑 Getting DB credentials from Secret Manager..."
+      DB_USER=$(gcloud secrets versions access latest --secret=${_DB_USER_SECRET})
+      DB_PASS=$(gcloud secrets versions access latest --secret=${_DB_PASSWORD_SECRET})
+      echo "DB_USER=$DB_USER" >> $BUILD_ENV
+      echo "DB_PASS=$DB_PASS" >> $BUILD_ENV
+  env:
+    - 'BUILD_ENV=/workspace/.env'
+
+# 4️⃣ Verify Cloud SQL connection using Cloud SQL Auth Proxy
+- name: 'gcr.io/cloudsql-docker/gce-proxy:1.33.7'
+  id: 'Check DB Connection'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "🔍 Testing connection to Cloud SQL instance ${_SQL_INSTANCE}..."
+      DB_USER=$(grep DB_USER /workspace/.env | cut -d= -f2)
+      DB_PASS=$(grep DB_PASS /workspace/.env | cut -d= -f2)
+      /cloud_sql_proxy -instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE}=tcp:5432 &
+      sleep 5
+      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "${_DB_NAME}" -c "SELECT NOW();" || {
+        echo "❌ Database connection failed!"; exit 1;
+      }
+      echo "✅ Database connection successful."
+
+# 5️⃣ Deploy backend to Cloud Run
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  id: 'Deploy Backend Service'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "🚀 Deploying ${_SERVICE} to Cloud Run..."
+      gcloud run deploy ${_SERVICE} \
+        --image=${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA \
+        --region=${_REGION} \
+        --platform=managed \
+        --service-account=${_SA_EMAIL} \
+        --cpu=1 \
+        --memory=1Gi \
+        --vpc-connector=${_VPC_CONNECTOR} \
+        --add-cloudsql-instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE} \
+        --set-env-vars=CLOUD_SQL_CONNECTION_NAME=${_PROJECT}:${_REGION}:${_SQL_INSTANCE},DB_NAME=${_DB_NAME},DB_USER_SECRET=${_DB_USER_SECRET},DB_PASSWORD_SECRET=${_DB_PASSWORD_SECRET} \
+        --allow-unauthenticated
+
+images:
+- '${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_SERVICE}:$SHORT_SHA'
+options:
+  logging: CLOUD_LOGGING_ONLY
