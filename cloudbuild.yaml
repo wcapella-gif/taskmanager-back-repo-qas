@@ -28,15 +28,13 @@ steps:
   args:
     - '-c'
     - |
-      echo "🔑 Getting DB credentials from Secret Manager..."
-      DB_USER=$(gcloud secrets versions access latest --secret=${_DB_USER_SECRET})
-      DB_PASS=$(gcloud secrets versions access latest --secret=${_DB_PASSWORD_SECRET})
+      echo "🔑 Getting DB credentials from Secret Manager..."    
+      DB_USER=projects/${PROJECT_ID}/secrets/${_DB_USER_SECRET_NAME}/versions/latest,\
+      DB_PASSWORD=projects/${PROJECT_ID}/secrets/${_DB_PASSWORD_SECRET_NAME}/versions/latest,\
       echo "DB_USER=$DB_USER" >> $BUILD_ENV
       echo "DB_PASS=$DB_PASS" >> $BUILD_ENV
   env:
     - 'BUILD_ENV=/workspace/.env'
-    - 'DB_USER=$DB_USER'
-    - 'DB_PASS=$DB_PASS'
 
 # 4️⃣ Verify Cloud SQL connection using Cloud SQL Auth Proxy
 - name: 'gcr.io/cloudsql-docker/gce-proxy:1.33.7'
@@ -46,17 +44,14 @@ steps:
     - '-c'
     - |
       echo "🔍 Testing connection to Cloud SQL instance ${_SQL_INSTANCE}..."
-      DB_USER=$(grep DB_USER /workspace/.env | cut -d= -f2)
-      DB_PASS=$(grep DB_PASS /workspace/.env | cut -d= -f2)
+      DB_USER=projects/${PROJECT_ID}/secrets/${_DB_USER_SECRET_NAME}/versions/latest,\
+      DB_PASSWORD=projects/${PROJECT_ID}/secrets/${_DB_PASSWORD_SECRET_NAME}/versions/latest,\
       /cloud_sql_proxy -instances=${_PROJECT}:${_REGION}:${_SQL_INSTANCE}=tcp:5432 &
       sleep 5
-      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "${_DB_NAME}" -c "SELECT NOW();" || {
+      PGPASSWORD="$DB_PASS" psql -h 172.30.96.5 -U "$DB_USER" -d "${_DB_NAME}" -c "SELECT NOW();" || {
         echo "❌ Database connection failed!"; exit 1;
       }
       echo "✅ Database connection successful."
-  env:
-    - 'DB_USER=$DB_USER'
-    - 'DB_PASS=$DB_PASS'
 
 
 # 5️⃣ Deploy backend to Cloud Run
