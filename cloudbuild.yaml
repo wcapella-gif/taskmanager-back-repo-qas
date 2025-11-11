@@ -35,6 +35,8 @@ steps:
       echo "DB_PASS=$DB_PASS" >> $BUILD_ENV
   env:
     - 'BUILD_ENV=/workspace/.env'
+    - 'DB_USER=$DB_USER'
+    - 'DB_PASS=$DB_PASS'
 
 # 4️⃣ Verify Cloud SQL connection using Cloud SQL Auth Proxy
 - name: 'gcr.io/cloudsql-docker/gce-proxy:1.33.7'
@@ -52,6 +54,10 @@ steps:
         echo "❌ Database connection failed!"; exit 1;
       }
       echo "✅ Database connection successful."
+  env:
+    - 'DB_USER=$DB_USER'
+    - 'DB_PASS=$DB_PASS'
+
 
 # 5️⃣ Deploy backend to Cloud Run
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
